@@ -3,7 +3,6 @@
 #include <string>
 
 #include "sura_bt/camera_nodes.hpp"
-#include "sura_bt/analyze_photo.hpp"
 #include "sura_bt/avoid_obstacle.hpp"
 #include "sura_bt/command_nodes.hpp"
 #include "sura_bt/controller_switch_nodes.hpp"
@@ -40,9 +39,6 @@ void registerNodes(BT::BehaviorTreeFactory & factory)
 
   registerNodeWithDescription<TakePhoto>(
     factory, "TakePhoto");
-
-  registerNodeWithDescription<AnalyzePhoto>(
-    factory, "AnalyzePhoto");
 
   registerNodeWithDescription<ActivateControllers>(
     factory, "ActivateControllers");

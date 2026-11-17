@@ -29,7 +29,8 @@ public:
     std::shared_ptr<sura_safety::SafetyAskState> state,
     std::shared_ptr<std::unordered_set<std::string>> completed_actions,
     std::string autonomous_tree_file,
-    std::string robot_profiles_file);
+    std::string robot_profiles_file,
+    bool safety_only = false);
 
   bool pending() const;
   void publishPending();
@@ -64,6 +65,7 @@ private:
   std::string paused_autonomous_xml_;
   CheckpointMap paused_checkpoints_;
   bool tree_reloaded_ = false;
+  bool safety_only_ = false;
 };
 
 }  // namespace sura_bt

@@ -658,20 +658,54 @@ static std::string normalizedRobotNamespace(const std::string & robot_namespace)
   return result;
 }
 
-static std::string getSafetyTreeFile(const std::string & robot_namespace)
+static std::string getSafetyTreeFile(
+  const std::string & robot_namespace, const std::string & path)
 {
-  const auto relative_path =
-    "trees/" + normalizedRobotNamespace(robot_namespace) + "_safety_branch.xml";
-  const auto tree_file = getTreeFile("sura_safety", relative_path);
-
+  const auto tree_file = getTreeFile("sura_safety", path);
   if (!std::filesystem::exists(tree_file))
   {
     throw std::runtime_error(
-      "No safety tree exists for robot_namespace='" + robot_namespace + "'. Expected " +
-      relative_path);
+      "No safety tree exists for robot_namespace='" + robot_namespace + "': " + path);
   }
-
   return tree_file;
+}
+
+struct BtSelection
+{
+  bool safety{true};
+  bool mission{true};
+  std::string safety_tree;
+};
+
+static BtSelection loadBtSelection(const std::string & robot_namespace)
+{
+  const auto package = robot_namespace + "_description";
+  const auto file = std::filesystem::path(
+    ament_index_cpp::get_package_share_directory(package)) /
+    "config" / "bringup_description.yaml";
+  const auto bringup = YAML::LoadFile(file.string());
+  const auto bt = bringup["bt"];
+  BtSelection selection;
+  selection.safety_tree =
+    "trees/" + normalizedRobotNamespace(robot_namespace) + "_safety_branch.xml";
+  if (bt)
+  {
+    if (!bt.IsMap()) {
+      throw std::runtime_error("bt must be a map in " + file.string());
+    }
+    if (bt["safety"]) {selection.safety = bt["safety"].as<bool>();}
+    if (bt["mission"]) {selection.mission = bt["mission"].as<bool>();}
+    if (bt["safety_tree"]) {
+      selection.safety_tree = bt["safety_tree"].as<std::string>();
+      if (selection.safety_tree.empty()) {
+        throw std::runtime_error("bt.safety_tree must not be empty in " + file.string());
+      }
+    }
+  }
+  if (!selection.safety && !selection.mission) {
+    throw std::runtime_error("bt.safety and bt.mission cannot both be false in " + file.string());
+  }
+  return selection;
 }
 
 static std::vector<std::string> discoverRobotsFromDiagnostics(
@@ -932,6 +966,21 @@ int main(int argc, char ** argv)
     sura_bt::parseRobotNamespaces(configured_robots);
   const bool multi_robot = robots.size() > 1;
   const std::string & robot_namespace = robots.front();
+  std::vector<BtSelection> bt_selections;
+  bt_selections.reserve(robots.size());
+  for (const auto & robot : robots) {
+    bt_selections.push_back(loadBtSelection(robot));
+  }
+  const auto & bt_selection = bt_selections.front();
+  for (std::size_t index = 1; index < bt_selections.size(); ++index) {
+    if (bt_selections[index].safety != bt_selection.safety ||
+      bt_selections[index].mission != bt_selection.mission)
+    {
+      throw std::runtime_error("Selected robots must use the same bt.safety and bt.mission values");
+    }
+  }
+  RCLCPP_INFO(ros_node->get_logger(), "BT selection: safety=%s mission=%s",
+    bt_selection.safety ? "true" : "false", bt_selection.mission ? "true" : "false");
 
   RCLCPP_INFO(
     ros_node->get_logger(),
@@ -948,76 +997,70 @@ int main(int argc, char ** argv)
     matrix_subscriptions;
   std::vector<rclcpp::Subscription<std_msgs::msg::String>::SharedPtr>
     description_subscriptions;
-  for (const auto & robot : robots) {
-    const auto topic = "/" + robot + "/controller/body_force/allocation_matrix";
-    matrix_subscriptions.push_back(ros_node->create_subscription<std_msgs::msg::Float64MultiArray>(
-      topic, rclcpp::QoS(1).reliable().transient_local(),
-      [robot, &allocation_matrices, &profile_dirty](
-        const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
-        allocation_matrices[robot] = *msg;
-        profile_dirty = true;
-      }));
-    const auto description_topic = "/" + robot + "/robot_description";
-    description_subscriptions.push_back(ros_node->create_subscription<std_msgs::msg::String>(
-      description_topic, rclcpp::QoS(1).reliable().transient_local(),
-      [robot, &rendered_descriptions, &profile_dirty](
-        const std_msgs::msg::String::SharedPtr msg) {
-        rendered_descriptions[robot] = *msg;
-        profile_dirty = true;
-      }));
+  nlohmann::ordered_json current_profiles = nlohmann::ordered_json::array();
+  if (bt_selection.mission) {
+    for (const auto & robot : robots) {
+      const auto topic = "/" + robot + "/controller/body_force/allocation_matrix";
+      matrix_subscriptions.push_back(ros_node->create_subscription<std_msgs::msg::Float64MultiArray>(
+        topic, rclcpp::QoS(1).reliable().transient_local(),
+        [robot, &allocation_matrices, &profile_dirty](
+          const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+          allocation_matrices[robot] = *msg;
+          profile_dirty = true;
+        }));
+      const auto description_topic = "/" + robot + "/robot_description";
+      description_subscriptions.push_back(ros_node->create_subscription<std_msgs::msg::String>(
+        description_topic, rclcpp::QoS(1).reliable().transient_local(),
+        [robot, &rendered_descriptions, &profile_dirty](
+          const std_msgs::msg::String::SharedPtr msg) {
+          rendered_descriptions[robot] = *msg;
+          profile_dirty = true;
+        }));
+    }
+    const auto matrix_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (rclcpp::ok() && (allocation_matrices.size() < robots.size() ||
+      rendered_descriptions.size() < robots.size()) &&
+      std::chrono::steady_clock::now() < matrix_deadline)
+    {
+      rclcpp::spin_some(ros_node);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    current_profiles = writeMissionRobotProfiles(
+      robots, allocation_matrices, rendered_descriptions, profile_path, relative_axis_threshold);
+    profile_dirty = false;
+    RCLCPP_INFO(
+      ros_node->get_logger(),
+      "Wrote mission robot profiles to '%s' (%zu/%zu descriptions, %zu/%zu allocation matrices)",
+      profile_path.c_str(), rendered_descriptions.size(), robots.size(),
+      allocation_matrices.size(), robots.size());
   }
-  const auto matrix_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-  while (rclcpp::ok() && (allocation_matrices.size() < robots.size() ||
-    rendered_descriptions.size() < robots.size()) &&
-    std::chrono::steady_clock::now() < matrix_deadline)
-  {
-    rclcpp::spin_some(ros_node);
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  auto current_profiles = writeMissionRobotProfiles(
-    robots, allocation_matrices, rendered_descriptions, profile_path, relative_axis_threshold);
-  profile_dirty = false;
-  RCLCPP_INFO(
-    ros_node->get_logger(),
-    "Wrote mission robot profiles to '%s' (%zu/%zu descriptions, %zu/%zu allocation matrices)",
-    profile_path.c_str(), rendered_descriptions.size(), robots.size(),
-    allocation_matrices.size(), robots.size());
 
-  const std::string tree_file =
-    getTreeFile("sura_bt", "trees/mission.xml");
+  const std::string tree_file = bt_selection.safety ?
+    getTreeFile("sura_bt", "trees/mission.xml") :
+    getTreeFile("sura_bt", "trees/mission_without_safety.xml");
   std::vector<std::string> safety_tree_files;
-  safety_tree_files.reserve(robots.size());
-  for (const auto & robot : robots)
-  {
-    safety_tree_files.push_back(getSafetyTreeFile(robot));
+  if (bt_selection.safety) {
+    for (std::size_t index = 0; index < robots.size(); ++index) {
+      safety_tree_files.push_back(
+        getSafetyTreeFile(robots[index], bt_selections[index].safety_tree));
+    }
   }
-  const std::string fleet_safety_file = multi_robot ?
+  const std::string fleet_safety_file = multi_robot && bt_selection.safety ?
     getTreeFile("sura_bt", "trees/fleet_safety.xml") : std::string{};
   const std::string autonomous_tree_file =
     getTreeFile("sura_bt", "trees/autonomous_branch.xml");
   const std::string teleop_tree_file =
     getTreeFile("sura_bt", "trees/teleop_branch.xml");
 
-  RCLCPP_INFO(
-    ros_node->get_logger(),
-    "Loading tree: %s",
-    tree_file.c_str()
-  );
-  for (const auto & safety_tree_file : safety_tree_files)
-  {
-    RCLCPP_INFO(
-      ros_node->get_logger(), "Loading safety tree: %s", safety_tree_file.c_str());
+  if (bt_selection.mission) {
+    RCLCPP_INFO(ros_node->get_logger(), "Loading tree: %s", tree_file.c_str());
+    RCLCPP_INFO(ros_node->get_logger(), "Loading autonomous tree: %s",
+      autonomous_tree_file.c_str());
+    RCLCPP_INFO(ros_node->get_logger(), "Loading teleop tree: %s", teleop_tree_file.c_str());
   }
-  RCLCPP_INFO(
-    ros_node->get_logger(),
-    "Loading autonomous tree: %s",
-    autonomous_tree_file.c_str()
-  );
-  RCLCPP_INFO(
-    ros_node->get_logger(),
-    "Loading teleop tree: %s",
-    teleop_tree_file.c_str()
-  );
+  for (const auto & safety_tree_file : safety_tree_files) {
+    RCLCPP_INFO(ros_node->get_logger(), "Loading safety tree: %s", safety_tree_file.c_str());
+  }
 
   auto blackboard = BT::Blackboard::create();
   auto safety_ask_state = std::make_shared<sura_safety::SafetyAskState>();
@@ -1028,12 +1071,14 @@ int main(int argc, char ** argv)
   blackboard->set("mission_completed_actions", mission_completed_actions);
   blackboard->set("mission_failure_reasons", mission_failure_reasons);
   blackboard->set("critical_safety_state", critical_safety_state);
-  for (const auto & robot : robots) {
-    const auto family = loadRobotProfile(robot).value("family", nlohmann::ordered_json(nullptr));
-    if (!family.is_string() || family.get<std::string>().empty()) {
-      throw std::runtime_error("Could not determine robot family for '" + robot + "'");
+  if (bt_selection.mission) {
+    for (const auto & robot : robots) {
+      const auto family = loadRobotProfile(robot).value("family", nlohmann::ordered_json(nullptr));
+      if (!family.is_string() || family.get<std::string>().empty()) {
+        throw std::runtime_error("Could not determine robot family for '" + robot + "'");
+      }
+      blackboard->set("robot_family_" + robot, family.get<std::string>());
     }
-    blackboard->set("robot_family_" + robot, family.get<std::string>());
   }
   const auto set_available_axes = [&blackboard](const nlohmann::ordered_json & profiles) {
     for (const auto & profile : profiles) {
@@ -1088,11 +1133,12 @@ int main(int argc, char ** argv)
       blackboard->set("switchable_controllers_" + robot, loadSwitchableControllers(robot));
     }
 
-    RCLCPP_WARN(
-      ros_node->get_logger(),
-      "The current mission XML uses robot_namespace='%s' for its existing commands; "
-      "safety is active for all selected robots",
-      robot_namespace.c_str());
+    if (bt_selection.mission) {
+      RCLCPP_WARN(
+        ros_node->get_logger(),
+        "The current mission XML uses robot_namespace='%s' for its existing commands",
+        robot_namespace.c_str());
+    }
   }
 
   auto build_tree = [&]() {
@@ -1101,43 +1147,60 @@ int main(int argc, char ** argv)
       sura_safety::registerSafetyNodes(factory);
       sura_bt::registerNodes(factory);
 
-      if (multi_robot)
+      if (bt_selection.safety)
       {
-        for (std::size_t index = 0; index < robots.size(); ++index)
+        if (multi_robot)
+        {
+          for (std::size_t index = 0; index < robots.size(); ++index)
+          {
+            factory.registerBehaviorTreeFromText(
+              sura_bt::renamedSafetyTreeXml(safety_tree_files[index], robots[index]));
+          }
+          factory.registerBehaviorTreeFromText(
+            sura_bt::expandedFleetSafetyXml(fleet_safety_file, robots));
+        }
+        else
         {
           factory.registerBehaviorTreeFromText(
-            sura_bt::renamedSafetyTreeXml(safety_tree_files[index], robots[index]));
+            sura_bt::resolvedSafetyTreeXml(safety_tree_files.front(), robots.front()));
         }
-        factory.registerBehaviorTreeFromText(
-          sura_bt::expandedFleetSafetyXml(fleet_safety_file, robots));
       }
-      else
+      if (bt_selection.mission)
       {
         factory.registerBehaviorTreeFromText(
-          sura_bt::resolvedSafetyTreeXml(safety_tree_files.front(), robots.front()));
+          sura_bt::checkpointedAutonomousTreeXml(autonomous_tree_file));
+        factory.registerBehaviorTreeFromFile(teleop_tree_file);
+        factory.registerBehaviorTreeFromFile(tree_file);
       }
-      factory.registerBehaviorTreeFromText(
-        sura_bt::checkpointedAutonomousTreeXml(autonomous_tree_file));
-      factory.registerBehaviorTreeFromFile(teleop_tree_file);
-      factory.registerBehaviorTreeFromFile(tree_file);
 
-      return factory.createTree("Mission", blackboard);
+      return factory.createTree(bt_selection.mission ? "Mission" : "SafetyBranch", blackboard);
     };
 
   auto tree = build_tree();
-  MissionProgress mission_progress(
-    ros_node, blackboard, mission_failure_reasons, critical_safety_state);
-  mission_progress.attach(tree, autonomous_tree_file);
+  std::unique_ptr<MissionProgress> mission_progress;
+  if (bt_selection.mission) {
+    mission_progress = std::make_unique<MissionProgress>(
+      ros_node, blackboard, mission_failure_reasons, critical_safety_state);
+    mission_progress->attach(tree, autonomous_tree_file);
+  }
 
-  auto publisher_zmq = std::make_unique<BT::PublisherZMQ>(tree);
+  std::unique_ptr<BT::PublisherZMQ> publisher_zmq;
+  if (bt_selection.mission) {
+    publisher_zmq = std::make_unique<BT::PublisherZMQ>(tree);
+  }
   std::vector<BT::Tree> retired_trees;
 
-  sura_bt::SafetyAskCoordinator safety_ask_coordinator(
-    ros_node, blackboard, safety_ask_state, mission_completed_actions,
-    autonomous_tree_file, profile_path);
+  std::unique_ptr<sura_bt::SafetyAskCoordinator> safety_ask_coordinator;
+  if (bt_selection.safety) {
+    safety_ask_coordinator = std::make_unique<sura_bt::SafetyAskCoordinator>(
+      ros_node, blackboard, safety_ask_state, mission_completed_actions,
+      autonomous_tree_file, profile_path, !bt_selection.mission);
+  }
 
-  auto reload_service = ros_node->create_service<std_srvs::srv::Trigger>(
-    "~/reload_autonomous_tree",
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reload_service;
+  if (bt_selection.mission) {
+    reload_service = ros_node->create_service<std_srvs::srv::Trigger>(
+      "~/reload_autonomous_tree",
     [&](
       const std::shared_ptr<std_srvs::srv::Trigger::Request>,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response)
@@ -1158,15 +1221,19 @@ int main(int argc, char ** argv)
 
       try
       {
-        safety_ask_coordinator.validateReload();
+        if (safety_ask_coordinator) {safety_ask_coordinator->validateReload();}
         auto new_tree = build_tree();
         tree.haltTree();
         publisher_zmq.reset();
         retired_trees.emplace_back(std::move(tree));
         tree = std::move(new_tree);
-        mission_progress.attach(tree, autonomous_tree_file);
+        mission_progress->attach(tree, autonomous_tree_file);
         publisher_zmq = std::make_unique<BT::PublisherZMQ>(tree);
-        safety_ask_coordinator.onReloadSuccess();
+        if (safety_ask_coordinator) {
+          safety_ask_coordinator->onReloadSuccess();
+        } else {
+          mission_completed_actions->clear();
+        }
 
         response->success = true;
         response->message = "AutonomousBranch reloaded";
@@ -1186,17 +1253,21 @@ int main(int argc, char ** argv)
           response->message.c_str());
       }
     });
+  }
 
   rclcpp::Rate rate(10.0);
 
   while (rclcpp::ok())
   {
     tree.tickRoot();
-    safety_ask_coordinator.publishPending();
-    mission_progress.afterTick(safety_ask_coordinator.pending());
+    if (safety_ask_coordinator) {safety_ask_coordinator->publishPending();}
+    if (mission_progress) {
+      mission_progress->afterTick(safety_ask_coordinator && safety_ask_coordinator->pending());
+    }
 
+    if (!rclcpp::ok()) {break;}
     rclcpp::spin_some(ros_node);
-    if (profile_dirty) {
+    if (bt_selection.mission && profile_dirty) {
       try {
         current_profiles = writeMissionRobotProfiles(
           robots, allocation_matrices, rendered_descriptions, profile_path, relative_axis_threshold);

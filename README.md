@@ -1,46 +1,51 @@
-# AnalyzePhoto
+# sura_bt
 
-`TakePhoto` guarda un PNG y entrega su ruta absoluta en `image_path`.
-`AnalyzePhoto` envía esa imagen y el `prompt` al servidor local de Qwen VL,
-escribe la respuesta en el puerto `answer` y la muestra en Mission Assistant.
-Si se omite `prompt`, describe brevemente la imagen en español. La hoja sigue
-en `RUNNING` durante la inferencia; `timeout` vale 180 s por defecto. Una
-imagen inválida, un servidor inaccesible o una respuesta vacía causan
-`FAILURE`. Si el árbol detiene la hoja, cancela la petición sin publicar una
-respuesta tardía.
+`bt_runner` ejecuta el árbol configurado a 10 Hz. Carga el árbol de seguridad
+elegido para `robot_namespace` desde `sura_safety` y, si se activa la misión,
+los árboles de teleoperación y autonomía de este paquete.
 
-```xml
-<Sequence>
-  <TakePhoto robot_namespace="blueboat" topic="/blueboat/camera/image"
-             image_path="{photo_path}"/>
-  <AnalyzePhoto robot_namespace="blueboat" image_path="{photo_path}"
-                prompt="¿Qué objetos aparecen en la imagen?"
-                answer="{photo_answer}"/>
-</Sequence>
+```bash
+ros2 run sura_bt bt_runner --ros-args -p robot_namespace:=bluerov
 ```
 
-Al ejecutar `AnalyzePhoto`, si el servidor local no responde, el nodo inicia
-`start_qwen_vl_cpu.sh` y espera hasta 180 segundos a que esté listo. Si ya hay
-un servidor activo, lo reutiliza. En este equipo están instalados `llama-server`
-y los pesos oficiales en `.sura/vision/` (directorio ignorado por Git). En otro
-equipo, instala una versión reciente de `llama-server`; si no hay modelo en
-`.sura/vision/`, el script obtiene `Qwen/Qwen3-VL-2B-Instruct-GGUF:Q4_K_M` y su
-proyector al primer arranque. Esa descarga requiere conexión a Internet. Puedes
-fijar `SURA_VLM_HOME` para usar otra ubicación local y
-`SURA_VLM_ENDPOINT` para configurar otro puerto de loopback. El servidor usa
-CPU y solo escucha en `127.0.0.1`. La respuesta se publica además en
-`/sura_bt_runner/vision_answers` para el puente de Mission Assistant. El
-modelo no controla el robot: cualquier uso posterior de `answer` debe estar
-representado explícitamente en el BT.
+Sin `robot_namespace`, espera a descubrir robots en `/diagnostics_agg`.
 
-Después de analizar una foto, puedes escribir preguntas de seguimiento en el
-mismo chat de Mission Assistant, por ejemplo «¿De qué color son los objetos?».
-El asistente identifica las preguntas sobre la foto y se las envía a Qwen VL
-con la última imagen y el diálogo visual reciente. Escribe
-`/foto ¿qué hay detrás del objeto?` para dirigir la pregunta a Qwen de forma
-explícita, incluso si Gemini no está disponible. Una pregunta sobre la foto
-durante `SafetyErrorAsk` no modifica ni reanuda la misión. «Borrar historial»
-olvida también la foto seleccionada y sus preguntas anteriores.
+## Selección de árboles
+
+El runner lee `bt` en `config/bringup_description.yaml` del paquete
+`<robot_namespace>_description`:
+
+```yaml
+bt:
+  safety: true
+  safety_tree: trees/bluerov_safety_branch.xml
+  mission: false
+```
+
+`safety_tree` es el XML de seguridad relativo al paquete `sura_safety` (también
+acepta una ruta absoluta). Si se omite, se usa
+`trees/<robot_namespace>_safety_branch.xml`. Cada robot puede elegir su propio
+XML; el archivo debe definir un árbol con ID `SafetyBranch`.
+
+`safety: true` carga el árbol de `sura_safety`. `mission: true` carga además
+teleoperación y autonomía. Con `mission: false` solo se ejecuta seguridad: no
+se generan perfiles de misión ni se ofrece la recarga del árbol autónomo. Una
+alerta `SafetyErrorAsk` se resuelve con los servicios habituales
+`/sura_bt_runner/resume_safety_ask` y `/sura_bt_runner/abort_safety_ask`, sin
+recargar una misión. También se admite `safety: false, mission: true` para
+lanzar únicamente teleoperación y autonomía. Ambos valores en `false` son un
+error. Si falta `bt`, ambos quedan en `true` para conservar el arranque anterior.
+Con varios robots, todos deben configurar la misma selección.
+
+# TakePhoto
+
+`TakePhoto` guarda una imagen PNG y entrega su ruta absoluta en `image_path`.
+La captura no inicia ningún modelo de análisis.
+
+```xml
+<TakePhoto robot_namespace="blueboat" topic="/blueboat/camera/image"
+           image_path="{photo_path}"/>
+```
 
 # DetectSeafloorAnomalies
 

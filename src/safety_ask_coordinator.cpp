@@ -22,11 +22,13 @@ SafetyAskCoordinator::SafetyAskCoordinator(
   std::shared_ptr<sura_safety::SafetyAskState> state,
   std::shared_ptr<std::unordered_set<std::string>> completed_actions,
   std::string autonomous_tree_file,
-  std::string robot_profiles_file)
+  std::string robot_profiles_file,
+  bool safety_only)
 : node_(node), blackboard_(blackboard), state_(std::move(state)),
   completed_actions_(std::move(completed_actions)),
   autonomous_tree_file_(std::move(autonomous_tree_file)),
-  robot_profiles_file_(std::move(robot_profiles_file))
+  robot_profiles_file_(std::move(robot_profiles_file)),
+  safety_only_(safety_only)
 {
   event_publisher_ = node_->create_publisher<std_msgs::msg::String>(
     "~/safety_ask", rclcpp::QoS(1).reliable().transient_local());
@@ -138,16 +140,19 @@ void SafetyAskCoordinator::publishPending()
   if (!pending() || state_->active_source == published_source_) {
     return;
   }
-  paused_autonomous_xml_ = readAutonomousXml();
-  const auto checkpointed_xml = checkpointedAutonomousTreeXml(autonomous_tree_file_);
-  paused_checkpoints_ = checkpointActions(checkpointed_xml);
   nlohmann::json event;
   event["source"] = state_->active_source;
   event["detail"] = state_->active_detail;
-  event["mission_file"] = autonomous_tree_file_;
-  event["robot_profiles_file"] = std::filesystem::absolute(robot_profiles_file_).string();
-  event["completed_actions"] = *completed_actions_;
-  event["checkpointed_tree_xml"] = checkpointed_xml;
+  event["mode"] = safety_only_ ? "safety_only" : "mission";
+  if (!safety_only_) {
+    paused_autonomous_xml_ = readAutonomousXml();
+    const auto checkpointed_xml = checkpointedAutonomousTreeXml(autonomous_tree_file_);
+    paused_checkpoints_ = checkpointActions(checkpointed_xml);
+    event["mission_file"] = autonomous_tree_file_;
+    event["robot_profiles_file"] = std::filesystem::absolute(robot_profiles_file_).string();
+    event["completed_actions"] = *completed_actions_;
+    event["checkpointed_tree_xml"] = checkpointed_xml;
+  }
   std_msgs::msg::String message;
   message.data = event.dump();
   event_publisher_->publish(message);
@@ -173,17 +178,19 @@ void SafetyAskCoordinator::resume(
 {
   std::string mission_state;
   blackboard_->get("mission_state", mission_state);
-  if (!pending() || !tree_reloaded_ || mission_state == "aborted") {
+  if (!pending() || (!safety_only_ && (!tree_reloaded_ || mission_state == "aborted"))) {
     response->success = false;
-    response->message = "A pending safety decision and a successful mission reload are required";
+    response->message = safety_only_ ? "No safety decision is pending" :
+      "A pending safety decision and a successful mission reload are required";
     return;
   }
   state_->resolve();
   blackboard_->set("mission_control", std::string("run"));
-  blackboard_->set("mission_state", std::string("running"));
+  blackboard_->set("mission_state", std::string(safety_only_ ? "idle" : "running"));
   resetSnapshot();
   response->success = true;
-  response->message = "Safety decision resolved; autonomous mission resumed";
+  response->message = safety_only_ ? "Safety decision resolved" :
+    "Safety decision resolved; autonomous mission resumed";
 }
 
 void SafetyAskCoordinator::abort(
@@ -199,7 +206,8 @@ void SafetyAskCoordinator::abort(
   blackboard_->set("mission_state", std::string("aborted"));
   resetSnapshot();
   response->success = true;
-  response->message = "Autonomous mission aborted after safety decision";
+  response->message = safety_only_ ? "Safety decision aborted" :
+    "Autonomous mission aborted after safety decision";
 }
 
 }  // namespace sura_bt

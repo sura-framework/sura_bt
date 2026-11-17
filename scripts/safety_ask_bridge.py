@@ -14,7 +14,6 @@ from std_srvs.srv import Trigger
 
 TOPIC = "/sura_bt_runner/safety_ask"
 MISSION_TOPIC = "/sura_bt_runner/mission_status"
-VISION_TOPIC = "/sura_bt_runner/vision_answers"
 WORKSPACE = Path(os.environ.get("SURA_WS_META", Path(__file__).resolve().parents[3]))
 
 
@@ -28,16 +27,6 @@ def listen():
     node.create_subscription(String, MISSION_TOPIC,
                              lambda msg: print(json.dumps({"mission_status": json.loads(msg.data)},
                                                           ensure_ascii=False), flush=True), qos)
-    vision_qos = QoSProfile(depth=10)
-    vision_qos.reliability = ReliabilityPolicy.RELIABLE
-    vision_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-    def forward_vision(msg):
-        try:
-            event = json.loads(msg.data)
-        except json.JSONDecodeError:
-            return
-        print(json.dumps({"vision_answer": event}, ensure_ascii=False), flush=True)
-    node.create_subscription(String, VISION_TOPIC, forward_vision, vision_qos)
     try:
         rclpy.spin(node)
     finally:

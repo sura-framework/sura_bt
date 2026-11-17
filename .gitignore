@@ -1,0 +1,6 @@
+/build/
+/install/
+/log/
+__pycache__/
+*.pyc
+/trees/autonomous_branch.generated.xml
